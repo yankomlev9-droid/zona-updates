@@ -1,15 +1,17 @@
 name: Publish Zona update
 
-# Upload a new 4-file Zona ZIP into the root of the repository.
-# The workflow validates it and publishes a GitHub Release automatically.
+# Preferred: upload one Zona_X.Y.Z_PUBLISH.zip to the repository root.
+# That outer ZIP contains: Zona_X.Y.Z_GITHUB_UPDATE_4_FILES.zip and RELEASE_NOTES.md.
+# Legacy four-file archives + release-notes/vX.Y.Z.md remain supported.
 on:
   push:
     paths:
+      - 'Zona_*_PUBLISH.zip'
       - 'Zona_*_GITHUB_UPDATE_4_FILES.zip'
   workflow_dispatch:
     inputs:
       archive:
-        description: 'Exact ZIP filename in the repository root (e.g. Zona_0.56.11_GITHUB_UPDATE_4_FILES.zip)'
+        description: 'Exact ZIP filename in repository root (e.g. Zona_0.56.13_PUBLISH.zip)'
         required: true
         type: string
 
@@ -22,7 +24,7 @@ concurrency:
 
 jobs:
   release:
-    name: Check ZIP and publish release
+    name: Verify Zona ZIP and create release
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -30,7 +32,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Validate the archive and release notes
+      - name: Validate and unpack publish package
         id: validate
         shell: bash
         env:
@@ -40,6 +42,7 @@ jobs:
           AFTER_SHA: ${{ github.sha }}
         run: |
           python3 <<'PY'
+          import io
           import os
           import re
           import subprocess
@@ -47,14 +50,16 @@ jobs:
           import zipfile
           from pathlib import Path
 
-          filename_pattern = re.compile(r'^Zona_(\d+\.\d+\.\d+)_GITHUB_UPDATE_4_FILES\.zip$')
+          package_re = re.compile(r'^Zona_(\d+\.\d+\.\d+)_PUBLISH\.zip$')
+          update_re = re.compile(r'^Zona_(\d+\.\d+\.\d+)_GITHUB_UPDATE_4_FILES\.zip$')
           expected = {'Zona.exe', 'OPEN_SETTINGS.cmd', 'OPEN_SEARCH_TEST.cmd', 'README.txt'}
+
+          def fail(message):
+              sys.exit(f'ERROR: {message}')
 
           if os.environ['EVENT_NAME'] == 'workflow_dispatch':
               filename = os.environ.get('ARCHIVE_INPUT', '').strip()
           else:
-              # The push payload's `commits` list can be empty even after a web upload.
-              # Read the changed paths from Git itself instead of trusting that list.
               before = os.environ.get('BEFORE_SHA', '').strip()
               after = os.environ['AFTER_SHA'].strip()
               if before and before != '0' * 40:
@@ -64,62 +69,91 @@ jobs:
               try:
                   changed = subprocess.check_output(cmd, text=True).splitlines()
               except subprocess.CalledProcessError as exc:
-                  sys.exit(f'Unable to inspect pushed files: {exc}')
-              matches = sorted(name for name in changed if filename_pattern.fullmatch(name))
+                  fail(f'Cannot inspect commit: {exc}')
+              matches = sorted(p for p in changed if package_re.fullmatch(p) or update_re.fullmatch(p))
               if len(matches) != 1:
-                  sys.exit(f'Expected exactly one uploaded Zona ZIP. Found: {matches}. For an existing ZIP, use Actions -> Run workflow.')
+                  fail(f'Expected one Zona ZIP uploaded to the repository root; found {matches}. For an existing ZIP use Actions > Run workflow.')
               filename = matches[0]
 
-          match = filename_pattern.fullmatch(filename)
-          if not match:
-              sys.exit(f'Invalid archive name: {filename!r}. Expected Zona_X.Y.Z_GITHUB_UPDATE_4_FILES.zip')
-          version = match.group(1)
-          path = Path(filename)
-          if not path.is_file():
-              sys.exit(f'Archive not found in repository root: {filename}')
-          if path.stat().st_size > 100 * 1024 * 1024:
-              sys.exit('Archive exceeds 100 MiB: check that you uploaded the compact 4-file version.')
+          package_match = package_re.fullmatch(filename)
+          update_match = update_re.fullmatch(filename)
+          if not package_match and not update_match:
+              fail(f'Unexpected ZIP name: {filename}. Use Zona_X.Y.Z_PUBLISH.zip')
+          version = (package_match or update_match).group(1)
+          source = Path(filename)
+          if not source.is_file() or source.stat().st_size > 100 * 1024 * 1024:
+              fail('ZIP missing or larger than 100 MiB')
 
+          if package_match:
+              expected_update_name = f'Zona_{version}_GITHUB_UPDATE_4_FILES.zip'
+              with zipfile.ZipFile(source) as outer:
+                  names = outer.namelist()
+                  if len(names) != 2 or set(names) != {expected_update_name, 'RELEASE_NOTES.md'}:
+                      fail(f'Publish package must contain only {expected_update_name} and RELEASE_NOTES.md, at ZIP root. Found: {names}')
+                  if outer.testzip() is not None:
+                      fail('Publish ZIP failed integrity check')
+                  if outer.getinfo(expected_update_name).file_size > 100 * 1024 * 1024:
+                      fail('Inner updater ZIP is too large')
+                  if outer.getinfo('RELEASE_NOTES.md').file_size > 1024 * 1024:
+                      fail('Release notes file is too large')
+                  update_data = outer.read(expected_update_name)
+                  try:
+                      notes_text = outer.read('RELEASE_NOTES.md').decode('utf-8-sig')
+                  except UnicodeDecodeError:
+                      fail('Release notes must be UTF-8')
+          else:
+              expected_update_name = filename
+              update_data = source.read_bytes()
+              notes_path = Path('release-notes') / f'v{version}.md'
+              if not notes_path.is_file():
+                  fail(f'Legacy release notes missing: {notes_path}')
+              notes_text = notes_path.read_text(encoding='utf-8-sig')
+
+          if not notes_text.strip():
+              fail('Release notes cannot be empty')
           try:
-              with zipfile.ZipFile(path) as z:
-                  names = z.namelist()
+              with zipfile.ZipFile(io.BytesIO(update_data)) as inner:
+                  names = inner.namelist()
                   if len(names) != 4 or set(names) != expected:
-                      sys.exit(f'ZIP must contain exactly {sorted(expected)} at its root. Found: {names}')
-                  bad = z.testzip()
-                  if bad is not None:
-                      sys.exit(f'ZIP integrity check failed for: {bad}')
-                  if z.read('Zona.exe')[:2] != b'MZ':
-                      sys.exit('Zona.exe does not look like a Windows executable.')
-                  readme = z.read('README.txt').decode('utf-8-sig', errors='replace')
+                      fail(f'Updater ZIP must have exactly four files at ZIP root. Found: {names}')
+                  if any(x.file_size > 100 * 1024 * 1024 for x in inner.infolist()):
+                      fail('One of the updater files is too large')
+                  if inner.testzip() is not None:
+                      fail('Updater ZIP failed integrity check')
+                  if inner.read('Zona.exe')[:2] != b'MZ':
+                      fail('Zona.exe is not a Windows PE executable')
+                  readme = inner.read('README.txt').decode('utf-8-sig', errors='replace')
                   if version not in readme:
-                      sys.exit('ZIP README.txt does not contain the version from the filename.')
-          except (OSError, zipfile.BadZipFile) as exc:
-              sys.exit(f'Cannot read ZIP: {exc}')
+                      fail(f'README.txt does not mention version {version}')
+          except zipfile.BadZipFile:
+              fail('Inner updater file is not a ZIP archive')
 
-          notes = Path('release-notes') / f'v{version}.md'
-          if not notes.is_file() or not notes.read_text(encoding='utf-8').strip():
-              sys.exit(f'User-friendly release notes missing: {notes}. Create them before uploading the ZIP.')
-
+          destination = Path(os.environ['RUNNER_TEMP']) / 'zona_publish'
+          destination.mkdir(parents=True, exist_ok=True)
+          out_zip = destination / expected_update_name
+          out_notes = destination / 'RELEASE_NOTES.md'
+          out_zip.write_bytes(update_data)
+          out_notes.write_text(notes_text, encoding='utf-8')
           with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as out:
-              out.write(f'filename={filename}\n')
+              out.write(f'file={out_zip}\n')
+              out.write(f'notes={out_notes}\n')
               out.write(f'version={version}\n')
               out.write(f'tag=v{version}\n')
-              out.write(f'notes={notes.as_posix()}\n')
-          print(f'ZIP OK: {filename}; release notes OK: {notes}')
+          print(f'Validated Zona {version}; prepared update ZIP and release notes')
           PY
 
       - name: Publish GitHub Release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          FILE: ${{ steps.validate.outputs.filename }}
+          FILE: ${{ steps.validate.outputs.file }}
+          NOTES: ${{ steps.validate.outputs.notes }}
           VERSION: ${{ steps.validate.outputs.version }}
           TAG: ${{ steps.validate.outputs.tag }}
-          NOTES: ${{ steps.validate.outputs.notes }}
         run: |
           set -euo pipefail
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "::error::Release $TAG already exists; it will not be overwritten automatically."
+            echo "::error::Release $TAG already exists. Refusing to overwrite it."
             exit 1
           fi
           gh release create "$TAG" "$FILE" \
@@ -127,4 +161,4 @@ jobs:
             --notes-file "$NOTES" \
             --target "$GITHUB_SHA" \
             --latest
-          echo "Published $TAG with asset $FILE"
+          echo "Published $TAG with $FILE"
