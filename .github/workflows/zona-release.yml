@@ -27,6 +27,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Validate the archive and release notes
         id: validate
@@ -34,11 +36,13 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           ARCHIVE_INPUT: ${{ inputs.archive }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
         run: |
           python3 <<'PY'
-          import json
           import os
           import re
+          import subprocess
           import sys
           import zipfile
           from pathlib import Path
@@ -49,15 +53,21 @@ jobs:
           if os.environ['EVENT_NAME'] == 'workflow_dispatch':
               filename = os.environ.get('ARCHIVE_INPUT', '').strip()
           else:
-              with open(os.environ['GITHUB_EVENT_PATH'], encoding='utf-8') as f:
-                  event = json.load(f)
-              changed = set()
-              for commit in event.get('commits', []):
-                  changed.update(commit.get('added', []))
-                  changed.update(commit.get('modified', []))
+              # The push payload's `commits` list can be empty even after a web upload.
+              # Read the changed paths from Git itself instead of trusting that list.
+              before = os.environ.get('BEFORE_SHA', '').strip()
+              after = os.environ['AFTER_SHA'].strip()
+              if before and before != '0' * 40:
+                  cmd = ['git', 'diff', '--name-only', '--diff-filter=AM', before, after]
+              else:
+                  cmd = ['git', 'show', '--pretty=format:', '--name-only', after]
+              try:
+                  changed = subprocess.check_output(cmd, text=True).splitlines()
+              except subprocess.CalledProcessError as exc:
+                  sys.exit(f'Unable to inspect pushed files: {exc}')
               matches = sorted(name for name in changed if filename_pattern.fullmatch(name))
               if len(matches) != 1:
-                  sys.exit(f'Expected one new Zona update ZIP, found: {matches}. Use Actions -> Run workflow to select an existing file.')
+                  sys.exit(f'Expected exactly one uploaded Zona ZIP. Found: {matches}. For an existing ZIP, use Actions -> Run workflow.')
               filename = matches[0]
 
           match = filename_pattern.fullmatch(filename)
