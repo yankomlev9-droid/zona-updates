@@ -1,0 +1,160 @@
+name: Publish LAZUR update
+
+on:
+  push:
+    paths:
+      - 'LAZUR_*_PUBLISH_KIT.zip'
+  workflow_dispatch:
+    inputs:
+      archive:
+        description: 'Name of ZIP in repository root, e.g. LAZUR_0.57.2_PUBLISH_KIT.zip'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: lazur-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Validate and publish LAZUR and source code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate publish kit
+        id: validate
+        shell: bash
+        env:
+          INPUT_ARCHIVE: ${{ inputs.archive }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          python3 <<'PY'
+          import hashlib
+          import io
+          import os
+          import re
+          import subprocess
+          import sys
+          import zipfile
+          from pathlib import Path
+
+          kit_re = re.compile(r'^LAZUR_(\d+\.\d+\.\d+)_PUBLISH_KIT\.zip$')
+          updater_files = {'LAZUR.exe', 'OPEN_SETTINGS.cmd', 'OPEN_SEARCH_TEST.cmd', 'README.txt'}
+
+          def fail(message):
+              sys.exit(f'ERROR: {message}')
+
+          if os.environ['GITHUB_EVENT_NAME'] == 'workflow_dispatch':
+              filename = os.environ.get('INPUT_ARCHIVE', '').strip()
+          else:
+              before = os.environ.get('BEFORE_SHA', '').strip()
+              after = os.environ['GITHUB_SHA']
+              cmd = ['git', 'diff', '--name-only', '--diff-filter=AM', before, after] if before and before != '0' * 40 else ['git', 'show', '--pretty=format:', '--name-only', after]
+              try:
+                  changed = subprocess.check_output(cmd, text=True).splitlines()
+              except subprocess.CalledProcessError as ex:
+                  fail(f'Cannot inspect changed files: {ex}')
+              matches = [p for p in changed if kit_re.fullmatch(p)]
+              if len(matches) != 1:
+                  fail(f'Exactly one LAZUR publish ZIP must be uploaded in one commit: {matches}')
+              filename = matches[0]
+
+          match = kit_re.fullmatch(filename)
+          if not match:
+              fail(f'Invalid ZIP name: {filename}')
+          version = match.group(1)
+          archive = Path(filename)
+          if not archive.is_file() or archive.stat().st_size > 100 * 1024 * 1024:
+              fail('Publish kit is missing or too large')
+          updater_name = f'LAZUR_{version}_GITHUB_UPDATE_4_FILES.zip'
+          source_name = f'LAZUR_{version}_RELEASE_SOURCE.zip'
+          notes_name = f'RELEASE_NOTES_LAZUR_{version}.md'
+          guide_name = f'PUBLISH_LAZUR_{version}_README_RU.md'
+          sha_name = f'LAZUR_{version}_SHA256SUMS.txt'
+          expected_kit = {updater_name, source_name, notes_name, guide_name, sha_name}
+
+          try:
+              with zipfile.ZipFile(archive) as kit:
+                  if len(kit.namelist()) != 5 or set(kit.namelist()) != expected_kit:
+                      fail(f'Wrong publish kit content: {kit.namelist()}')
+                  if any(z.file_size > 100 * 1024 * 1024 for z in kit.infolist()):
+                      fail('Publish kit member exceeds 100 MiB')
+                  if kit.testzip() is not None:
+                      fail('Publish kit ZIP corruption')
+                  raw = {name: kit.read(name) for name in expected_kit}
+          except zipfile.BadZipFile as ex:
+              fail(f'Invalid publish kit ZIP: {ex}')
+
+          try:
+              notes = raw[notes_name].decode('utf-8-sig')
+              sha_lines = raw[sha_name].decode('utf-8-sig').splitlines()
+          except UnicodeDecodeError:
+              fail('Release notes or SHA file must be UTF-8')
+          if version not in notes or not notes.strip():
+              fail('Release notes missing or wrong version')
+          checksums = {}
+          for line in sha_lines:
+              if not line.strip():
+                  continue
+              m = re.fullmatch(r'([a-fA-F0-9]{64})  ([^\s]+)', line)
+              if not m:
+                  fail(f'Bad SHA256SUMS line: {line[:100]}')
+              checksums[m.group(2)] = m.group(1).lower()
+          for name in (updater_name, source_name, notes_name, guide_name):
+              if checksums.get(name) != hashlib.sha256(raw[name]).hexdigest():
+                  fail(f'SHA256 mismatch or missing value: {name}')
+
+          try:
+              with zipfile.ZipFile(io.BytesIO(raw[updater_name])) as update:
+                  if len(update.namelist()) != 4 or set(update.namelist()) != updater_files:
+                      fail(f'Updater ZIP must contain exactly four files: {update.namelist()}')
+                  if update.testzip() is not None or update.read('LAZUR.exe')[:2] != b'MZ':
+                      fail('Updater ZIP is corrupt or LAZUR.exe is invalid')
+                  if version not in update.read('README.txt').decode('utf-8-sig', errors='replace'):
+                      fail('Updater README does not mention version')
+              with zipfile.ZipFile(io.BytesIO(raw[source_name])) as sources:
+                  if sources.testzip() is not None or len(sources.namelist()) < 10:
+                      fail('Source code archive is corrupt or empty')
+          except zipfile.BadZipFile as ex:
+              fail(f'Invalid inner ZIP: {ex}')
+
+          dest = Path(os.environ['RUNNER_TEMP']) / 'lazur_publish'
+          dest.mkdir(parents=True, exist_ok=True)
+          update_path, source_path, notes_path = dest / updater_name, dest / source_name, dest / 'RELEASE_NOTES.md'
+          update_path.write_bytes(raw[updater_name])
+          source_path.write_bytes(raw[source_name])
+          notes_path.write_text(notes, encoding='utf-8')
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write(f'update={update_path}\nsource={source_path}\nnotes={notes_path}\n')
+              output.write(f'version={version}\ntag=lazur-v{version}\n')
+          print(f'Validated LAZUR {version} and its separate sources')
+          PY
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPDATE: ${{ steps.validate.outputs.update }}
+          SOURCES: ${{ steps.validate.outputs.source }}
+          NOTES: ${{ steps.validate.outputs.notes }}
+          VERSION: ${{ steps.validate.outputs.version }}
+          TAG: ${{ steps.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::Release $TAG already exists; will not overwrite it."
+            exit 1
+          fi
+          TITLE=$(head -n 1 "$NOTES" | sed 's/^# //')
+          [[ "$TITLE" == "LAZUR $VERSION"* ]] || TITLE="LAZUR $VERSION"
+          gh release create "$TAG" "$UPDATE" "$SOURCES" \
+            --title "$TITLE" \
+            --notes-file "$NOTES" \
+            --target "$GITHUB_SHA" \
+            --latest=false
+          echo "Published $TAG with update ZIP and source ZIP"
